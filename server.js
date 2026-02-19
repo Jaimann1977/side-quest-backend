@@ -40,6 +40,54 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ─── POST /polish — polish description text with AI ──────────────────────────
+app.post('/polish', async (req, res) => {
+    try {
+        const { description } = req.body;
+        
+        if (!description || !description.trim()) {
+            return res.status(400).json({ error: 'Description is required' });
+        }
+
+        if (!process.env.GROQ_API_KEY) {
+            return res.status(500).json({ error: 'AI service not configured' });
+        }
+
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'llama-3.3-70b-versatile',
+                messages: [{
+                    role: 'user',
+                    content: `Polish this business/service description to be more professional, engaging, and compelling. Keep it concise (under 250 words). Maintain the original meaning and key details. Only return the polished description, no preamble or explanation.
+
+Original description:
+${description}`
+                }],
+                temperature: 0.7,
+                max_tokens: 500
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Groq API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const polishedText = data.choices[0].message.content.trim();
+
+        res.json({ polished: polishedText });
+
+    } catch (err) {
+        console.error('POST /polish error:', err);
+        res.status(500).json({ error: 'Failed to polish description' });
+    }
+});
+
 // ─── GET /cards — fetch all active (non-expired) cards ───────────────────────
 app.get('/cards', async (req, res) => {
     try {
@@ -63,7 +111,7 @@ app.post('/cards', upload.fields([
     { name: 'productImages', maxCount: 10 }
 ]), async (req, res) => {
     try {
-        const { businessName, employeeName, description } = req.body;
+        const { businessName, employeeName, webpageUrl, description } = req.body;
 
         // Validate required fields
         if (!businessName || !employeeName || !description) {
@@ -91,6 +139,7 @@ app.post('/cards', upload.fields([
             .insert([{
                 business_name: businessName,
                 employee_name: employeeName,
+                webpage_url: webpageUrl || null,
                 description,
                 cover_image_url: coverImageUrl,
                 product_image_urls: productImageUrls
