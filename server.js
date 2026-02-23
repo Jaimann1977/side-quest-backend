@@ -169,25 +169,42 @@ app.put('/cards/:id', upload.fields([
         const { id } = req.params;
         const { businessName, employeeName, webpageUrl, description, existingCoverImage, existingProductImages } = req.body;
 
+        console.log('=== PUT /cards/:id DEBUG ===');
+        console.log('Card ID:', id);
+        console.log('Request body:', { businessName, employeeName, webpageUrl, description });
+        console.log('existingCoverImage:', existingCoverImage);
+        console.log('existingProductImages:', existingProductImages);
+        console.log('Files:', req.files);
+
         // Validate required fields
         if (!businessName || !employeeName || !description) {
+            console.log('Validation failed: missing required fields');
             return res.status(400).json({ error: 'businessName, employeeName, and description are required' });
         }
 
         // Fetch existing card
+        console.log('Fetching existing card...');
         const { data: existingCard, error: fetchError } = await supabase
             .from('cards')
             .select('*')
             .eq('id', id)
             .single();
 
-        if (fetchError) throw fetchError;
-        if (!existingCard) return res.status(404).json({ error: 'Card not found' });
+        if (fetchError) {
+            console.log('Fetch error:', fetchError);
+            throw fetchError;
+        }
+        if (!existingCard) {
+            console.log('Card not found');
+            return res.status(404).json({ error: 'Card not found' });
+        }
+        console.log('Existing card found:', existingCard);
 
         // Handle cover image
         let coverImageUrl = existingCard.cover_image_url; // Default to current
         
         if (req.files?.coverImage?.[0]) {
+            console.log('New cover image uploaded, deleting old one');
             // User uploaded a NEW cover image
             // Delete old cover image if it exists
             if (existingCard.cover_image_url) {
@@ -199,9 +216,13 @@ app.put('/cards/:id', upload.fields([
             }
             // Upload new cover image
             coverImageUrl = await uploadImage(req.files.coverImage[0]);
+            console.log('New cover image uploaded:', coverImageUrl);
         } else if (existingCoverImage && existingCoverImage !== 'null' && existingCoverImage !== 'undefined') {
+            console.log('Using existing cover image from form:', existingCoverImage);
             // User explicitly wants to keep existing image (sent from frontend)
             coverImageUrl = existingCoverImage;
+        } else {
+            console.log('Keeping current cover image:', coverImageUrl);
         }
         // else: keep the existing card's cover_image_url (already set above)
 
@@ -213,24 +234,30 @@ app.put('/cards/:id', upload.fields([
             try {
                 const parsed = JSON.parse(existingProductImages);
                 productImageUrls = Array.isArray(parsed) ? parsed : [];
+                console.log('Parsed existing product images:', productImageUrls.length, 'images');
             } catch (e) {
+                console.log('Failed to parse existingProductImages:', e);
                 productImageUrls = [];
             }
         }
 
         // Upload new product images
         if (req.files?.productImages) {
+            console.log('Uploading', req.files.productImages.length, 'new product images');
             for (const file of req.files.productImages) {
                 const url = await uploadImage(file);
                 productImageUrls.push(url);
             }
         }
 
+        console.log('Final product images count:', productImageUrls.length);
+
         // Delete product images that were removed
         if (existingCard.product_image_urls && Array.isArray(existingCard.product_image_urls)) {
             for (const oldUrl of existingCard.product_image_urls) {
                 if (!productImageUrls.includes(oldUrl)) {
                     try {
+                        console.log('Deleting removed product image:', oldUrl);
                         await deleteImage(urlToStoragePath(oldUrl));
                     } catch (err) {
                         console.error('Error deleting old product image:', err);
@@ -240,6 +267,15 @@ app.put('/cards/:id', upload.fields([
         }
 
         // Update card in database
+        console.log('Updating card in database with data:', {
+            business_name: businessName,
+            employee_name: employeeName,
+            webpage_url: webpageUrl || null,
+            description,
+            cover_image_url: coverImageUrl,
+            product_image_urls_count: productImageUrls.length
+        });
+
         const { data, error } = await supabase
             .from('cards')
             .update({
@@ -254,7 +290,12 @@ app.put('/cards/:id', upload.fields([
             .select()
             .single();
 
-        if (error) throw error;
+        if (error) {
+            console.log('Supabase update error:', error);
+            throw error;
+        }
+        
+        console.log('Update successful, returning:', data);
         res.json(data);
 
     } catch (err) {
