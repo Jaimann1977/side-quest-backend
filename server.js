@@ -34,7 +34,7 @@ const allowedOrigins = process.env.FRONTEND_URL
 
 app.use(cors({
     origin: allowedOrigins,
-    methods: ['GET', 'POST', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type']
 }));
 app.use(express.json());
@@ -157,6 +157,103 @@ app.post('/cards', upload.fields([
     } catch (err) {
         console.error('POST /cards error:', err);
         res.status(500).json({ error: err.message || 'Failed to create card' });
+    }
+});
+
+// ─── PUT /cards/:id — update an existing card ────────────────────────────────
+app.put('/cards/:id', upload.fields([
+    { name: 'coverImage', maxCount: 1 },
+    { name: 'productImages', maxCount: 10 }
+]), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { businessName, employeeName, webpageUrl, description, existingCoverImage, existingProductImages } = req.body;
+
+        // Validate required fields
+        if (!businessName || !employeeName || !description) {
+            return res.status(400).json({ error: 'businessName, employeeName, and description are required' });
+        }
+
+        // Fetch existing card
+        const { data: existingCard, error: fetchError } = await supabase
+            .from('cards')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (fetchError) throw fetchError;
+        if (!existingCard) return res.status(404).json({ error: 'Card not found' });
+
+        // Handle cover image
+        let coverImageUrl = existingCoverImage || existingCard.cover_image_url;
+        if (req.files?.coverImage?.[0]) {
+            // Delete old cover image if it exists
+            if (existingCard.cover_image_url) {
+                try {
+                    await deleteImage(urlToStoragePath(existingCard.cover_image_url));
+                } catch (err) {
+                    console.error('Error deleting old cover image:', err);
+                }
+            }
+            // Upload new cover image
+            coverImageUrl = await uploadImage(req.files.coverImage[0]);
+        }
+
+        // Handle product images
+        let productImageUrls = [];
+        
+        // Parse existing product images
+        if (existingProductImages) {
+            try {
+                const parsed = JSON.parse(existingProductImages);
+                productImageUrls = Array.isArray(parsed) ? parsed : [];
+            } catch (e) {
+                productImageUrls = [];
+            }
+        }
+
+        // Upload new product images
+        if (req.files?.productImages) {
+            for (const file of req.files.productImages) {
+                const url = await uploadImage(file);
+                productImageUrls.push(url);
+            }
+        }
+
+        // Delete product images that were removed
+        if (existingCard.product_image_urls && Array.isArray(existingCard.product_image_urls)) {
+            for (const oldUrl of existingCard.product_image_urls) {
+                if (!productImageUrls.includes(oldUrl)) {
+                    try {
+                        await deleteImage(urlToStoragePath(oldUrl));
+                    } catch (err) {
+                        console.error('Error deleting old product image:', err);
+                    }
+                }
+            }
+        }
+
+        // Update card in database
+        const { data, error } = await supabase
+            .from('cards')
+            .update({
+                business_name: businessName,
+                employee_name: employeeName,
+                webpage_url: webpageUrl || null,
+                description,
+                cover_image_url: coverImageUrl,
+                product_image_urls: productImageUrls
+            })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+
+    } catch (err) {
+        console.error('PUT /cards/:id error:', err);
+        res.status(500).json({ error: err.message || 'Failed to update card' });
     }
 });
 
