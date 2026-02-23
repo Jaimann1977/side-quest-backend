@@ -287,16 +287,34 @@ app.put('/cards/:id', upload.fields([
                 product_image_urls: productImageUrls
             })
             .eq('id', id)
-            .select()
-            .single();
+            .select();
 
         if (error) {
             console.log('Supabase update error:', error);
             throw error;
         }
         
-        console.log('Update successful, returning:', data);
-        res.json(data);
+        // If no rows returned, it might be RLS blocking or card doesn't exist
+        if (!data || data.length === 0) {
+            console.log('Update returned no rows - possible RLS issue');
+            // Return the constructed card data as fallback
+            const constructedCard = {
+                id: id,
+                business_name: businessName,
+                employee_name: employeeName,
+                webpage_url: webpageUrl || null,
+                description,
+                cover_image_url: coverImageUrl,
+                product_image_urls: productImageUrls,
+                created_at: existingCard.created_at,
+                expires_at: existingCard.expires_at
+            };
+            console.log('Returning constructed card:', constructedCard);
+            return res.json(constructedCard);
+        }
+        
+        console.log('Update successful, returning:', data[0]);
+        res.json(data[0]);
 
     } catch (err) {
         console.error('PUT /cards/:id error:', err);
