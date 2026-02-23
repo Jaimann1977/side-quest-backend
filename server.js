@@ -185,8 +185,10 @@ app.put('/cards/:id', upload.fields([
         if (!existingCard) return res.status(404).json({ error: 'Card not found' });
 
         // Handle cover image
-        let coverImageUrl = existingCoverImage || existingCard.cover_image_url;
+        let coverImageUrl = existingCard.cover_image_url; // Default to current
+        
         if (req.files?.coverImage?.[0]) {
+            // User uploaded a NEW cover image
             // Delete old cover image if it exists
             if (existingCard.cover_image_url) {
                 try {
@@ -197,7 +199,11 @@ app.put('/cards/:id', upload.fields([
             }
             // Upload new cover image
             coverImageUrl = await uploadImage(req.files.coverImage[0]);
+        } else if (existingCoverImage && existingCoverImage !== 'null' && existingCoverImage !== 'undefined') {
+            // User explicitly wants to keep existing image (sent from frontend)
+            coverImageUrl = existingCoverImage;
         }
+        // else: keep the existing card's cover_image_url (already set above)
 
         // Handle product images
         let productImageUrls = [];
