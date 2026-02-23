@@ -359,6 +359,15 @@ function urlToStoragePath(url) {
     return idx !== -1 ? url.substring(idx + marker.length) : url;
 }
 
+// Delete an image from Supabase Storage
+async function deleteImage(storagePath) {
+    const { error } = await supabase.storage
+        .from('side-quest-images')
+        .remove([storagePath]);
+    
+    if (error) throw error;
+}
+
 // ─── Start server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`Side Quest backend running on port ${PORT}`);
