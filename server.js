@@ -2,18 +2,24 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Supabase client
-const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY
-);
+// ─── Firebase Admin Init ──────────────────────────────────────────────────────
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-// Multer: store uploads in memory before sending to Supabase
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    storageBucket: `${serviceAccount.project_id}.firebasestorage.app`
+});
+
+const db = admin.firestore();
+const bucket = admin.storage().bucket();
+const cardsCollection = db.collection('cards');
+
+// ─── Multer: memory storage ───────────────────────────────────────────────────
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max per file
@@ -27,8 +33,8 @@ const upload = multer({
     }
 });
 
-// Middleware
-const allowedOrigins = process.env.FRONTEND_URL 
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const allowedOrigins = process.env.FRONTEND_URL
     ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
     : '*';
 
@@ -39,7 +45,7 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ─── Health check ────────────────────────────────────────────────────────────
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -48,7 +54,7 @@ app.get('/health', (req, res) => {
 app.post('/polish', async (req, res) => {
     try {
         const { description } = req.body;
-        
+
         if (!description || !description.trim()) {
             return res.status(400).json({ error: 'Description is required' });
         }
@@ -67,10 +73,7 @@ app.post('/polish', async (req, res) => {
                 model: 'llama-3.3-70b-versatile',
                 messages: [{
                     role: 'user',
-                    content: `Polish this business/service description to be more professional, engaging, and compelling. Keep it concise (under 250 words). Maintain the original meaning and key details. Only return the polished description, no preamble or explanation.
-
-Original description:
-${description}`
+                    content: `Polish this business/service description to be more professional, engaging, and compelling. Keep it concise (under 250 words). Maintain the original meaning and key details. Only return the polished description, no preamble or explanation.\n\nOriginal description:\n${description}`
                 }],
                 temperature: 0.7,
                 max_tokens: 500
@@ -83,7 +86,6 @@ ${description}`
 
         const data = await response.json();
         const polishedText = data.choices[0].message.content.trim();
-
         res.json({ polished: polishedText });
 
     } catch (err) {
@@ -95,21 +97,30 @@ ${description}`
 // ─── GET /cards — fetch all active (non-expired) cards ───────────────────────
 app.get('/cards', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('cards')
-            .select('*')
-            .gt('expires_at', new Date().toISOString())
-            .order('created_at', { ascending: false });
+        const now = admin.firestore.Timestamp.now();
 
-        if (error) throw error;
-        res.json(data);
+        const snapshot = await cardsCollection
+            .where('expires_at', '>', now)
+            .orderBy('expires_at', 'desc')
+            .get();
+
+        const cards = [];
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            cards.push(formatCard(doc.id, data));
+        });
+
+        // Sort by created_at descending (newest first)
+        cards.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+        res.json(cards);
     } catch (err) {
         console.error('GET /cards error:', err);
         res.status(500).json({ error: 'Failed to fetch cards' });
     }
 });
 
-// ─── POST /cards — submit a new card with images ─────────────────────────────
+// ─── POST /cards — submit a new card with images ──────────────────────────────
 app.post('/cards', upload.fields([
     { name: 'coverImage', maxCount: 1 },
     { name: 'productImages', maxCount: 10 }
@@ -117,7 +128,6 @@ app.post('/cards', upload.fields([
     try {
         const { businessName, employeeName, webpageUrl, description } = req.body;
 
-        // Validate required fields
         if (!businessName || !employeeName || !description) {
             return res.status(400).json({ error: 'businessName, employeeName, and description are required' });
         }
@@ -137,22 +147,23 @@ app.post('/cards', upload.fields([
             }
         }
 
-        // Insert card into database
-        const { data, error } = await supabase
-            .from('cards')
-            .insert([{
-                business_name: businessName,
-                employee_name: employeeName,
-                webpage_url: webpageUrl || null,
-                description,
-                cover_image_url: coverImageUrl,
-                product_image_urls: productImageUrls
-            }])
-            .select()
-            .single();
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
-        if (error) throw error;
-        res.status(201).json(data);
+        const cardData = {
+            business_name: businessName,
+            employee_name: employeeName,
+            webpage_url: webpageUrl || null,
+            description,
+            cover_image_url: coverImageUrl,
+            product_image_urls: productImageUrls,
+            created_at: admin.firestore.Timestamp.fromDate(now),
+            expires_at: admin.firestore.Timestamp.fromDate(expiresAt)
+        };
+
+        const docRef = await cardsCollection.add(cardData);
+
+        res.status(201).json(formatCard(docRef.id, cardData));
 
     } catch (err) {
         console.error('POST /cards error:', err);
@@ -169,44 +180,29 @@ app.put('/cards/:id', upload.fields([
         const { id } = req.params;
         const { businessName, employeeName, webpageUrl, description, existingCoverImage, existingProductImages } = req.body;
 
-        console.log('=== PUT /cards/:id DEBUG ===');
+        console.log('=== PUT /cards/:id ===');
         console.log('Card ID:', id);
-        console.log('Request body:', { businessName, employeeName, webpageUrl, description });
-        console.log('existingCoverImage:', existingCoverImage);
-        console.log('existingProductImages:', existingProductImages);
-        console.log('Files:', req.files);
 
-        // Validate required fields
         if (!businessName || !employeeName || !description) {
-            console.log('Validation failed: missing required fields');
             return res.status(400).json({ error: 'businessName, employeeName, and description are required' });
         }
 
         // Fetch existing card
-        console.log('Fetching existing card...');
-        const { data: existingCard, error: fetchError } = await supabase
-            .from('cards')
-            .select('*')
-            .eq('id', id)
-            .single();
+        const docRef = cardsCollection.doc(id);
+        const docSnap = await docRef.get();
 
-        if (fetchError) {
-            console.log('Fetch error:', fetchError);
-            throw fetchError;
-        }
-        if (!existingCard) {
-            console.log('Card not found');
+        if (!docSnap.exists) {
             return res.status(404).json({ error: 'Card not found' });
         }
-        console.log('Existing card found:', existingCard);
+
+        const existingCard = docSnap.data();
+        console.log('Existing card found:', existingCard.business_name);
 
         // Handle cover image
-        let coverImageUrl = existingCard.cover_image_url; // Default to current
-        
+        let coverImageUrl = existingCard.cover_image_url;
+
         if (req.files?.coverImage?.[0]) {
-            console.log('New cover image uploaded, deleting old one');
-            // User uploaded a NEW cover image
-            // Delete old cover image if it exists
+            // Delete old cover image
             if (existingCard.cover_image_url) {
                 try {
                     await deleteImage(urlToStoragePath(existingCard.cover_image_url));
@@ -214,107 +210,58 @@ app.put('/cards/:id', upload.fields([
                     console.error('Error deleting old cover image:', err);
                 }
             }
-            // Upload new cover image
             coverImageUrl = await uploadImage(req.files.coverImage[0]);
             console.log('New cover image uploaded:', coverImageUrl);
         } else if (existingCoverImage && existingCoverImage !== 'null' && existingCoverImage !== 'undefined') {
-            console.log('Using existing cover image from form:', existingCoverImage);
-            // User explicitly wants to keep existing image (sent from frontend)
             coverImageUrl = existingCoverImage;
-        } else {
-            console.log('Keeping current cover image:', coverImageUrl);
         }
-        // else: keep the existing card's cover_image_url (already set above)
 
         // Handle product images
         let productImageUrls = [];
-        
-        // Parse existing product images
+
         if (existingProductImages) {
             try {
                 const parsed = JSON.parse(existingProductImages);
                 productImageUrls = Array.isArray(parsed) ? parsed : [];
-                console.log('Parsed existing product images:', productImageUrls.length, 'images');
             } catch (e) {
-                console.log('Failed to parse existingProductImages:', e);
                 productImageUrls = [];
             }
         }
 
         // Upload new product images
         if (req.files?.productImages) {
-            console.log('Uploading', req.files.productImages.length, 'new product images');
             for (const file of req.files.productImages) {
                 const url = await uploadImage(file);
                 productImageUrls.push(url);
             }
         }
 
-        console.log('Final product images count:', productImageUrls.length);
-
-        // Delete product images that were removed
-        if (existingCard.product_image_urls && Array.isArray(existingCard.product_image_urls)) {
+        // Delete removed product images from storage
+        if (existingCard.product_image_urls?.length) {
             for (const oldUrl of existingCard.product_image_urls) {
                 if (!productImageUrls.includes(oldUrl)) {
                     try {
-                        console.log('Deleting removed product image:', oldUrl);
                         await deleteImage(urlToStoragePath(oldUrl));
                     } catch (err) {
-                        console.error('Error deleting old product image:', err);
+                        console.error('Error deleting removed product image:', err);
                     }
                 }
             }
         }
 
-        // Update card in database
-        console.log('Updating card in database with data:', {
+        const updateData = {
             business_name: businessName,
             employee_name: employeeName,
             webpage_url: webpageUrl || null,
             description,
             cover_image_url: coverImageUrl,
-            product_image_urls_count: productImageUrls.length
-        });
+            product_image_urls: productImageUrls
+        };
 
-        const { data, error } = await supabase
-            .from('cards')
-            .update({
-                business_name: businessName,
-                employee_name: employeeName,
-                webpage_url: webpageUrl || null,
-                description,
-                cover_image_url: coverImageUrl,
-                product_image_urls: productImageUrls
-            })
-            .eq('id', id)
-            .select();
+        await docRef.update(updateData);
+        console.log('Update successful');
 
-        if (error) {
-            console.log('Supabase update error:', error);
-            throw error;
-        }
-        
-        // If no rows returned, it might be RLS blocking or card doesn't exist
-        if (!data || data.length === 0) {
-            console.log('Update returned no rows - possible RLS issue');
-            // Return the constructed card data as fallback
-            const constructedCard = {
-                id: id,
-                business_name: businessName,
-                employee_name: employeeName,
-                webpage_url: webpageUrl || null,
-                description,
-                cover_image_url: coverImageUrl,
-                product_image_urls: productImageUrls,
-                created_at: existingCard.created_at,
-                expires_at: existingCard.expires_at
-            };
-            console.log('Returning constructed card:', constructedCard);
-            return res.json(constructedCard);
-        }
-        
-        console.log('Update successful, returning:', data[0]);
-        res.json(data[0]);
+        res.json(formatCard(id, { ...existingCard, ...updateData }));
 
     } catch (err) {
         console.error('PUT /cards/:id error:', err);
@@ -326,35 +273,26 @@ app.put('/cards/:id', upload.fields([
 app.delete('/cards/:id', async (req, res) => {
     try {
         const { id } = req.params;
+        const docRef = cardsCollection.doc(id);
+        const docSnap = await docRef.get();
 
-        // Fetch card first to get image URLs for cleanup
-        const { data: card, error: fetchError } = await supabase
-            .from('cards')
-            .select('*')
-            .eq('id', id)
-            .single();
+        if (!docSnap.exists) {
+            return res.status(404).json({ error: 'Card not found' });
+        }
 
-        if (fetchError) throw fetchError;
-        if (!card) return res.status(404).json({ error: 'Card not found' });
+        const card = docSnap.data();
 
         // Delete images from storage
-        const imagesToDelete = [];
-        if (card.cover_image_url) imagesToDelete.push(urlToStoragePath(card.cover_image_url));
+        if (card.cover_image_url) {
+            try { await deleteImage(urlToStoragePath(card.cover_image_url)); } catch (e) {}
+        }
         if (card.product_image_urls?.length) {
-            card.product_image_urls.forEach(url => imagesToDelete.push(urlToStoragePath(url)));
+            for (const url of card.product_image_urls) {
+                try { await deleteImage(urlToStoragePath(url)); } catch (e) {}
+            }
         }
 
-        if (imagesToDelete.length > 0) {
-            await supabase.storage.from('side-quest-images').remove(imagesToDelete);
-        }
-
-        // Delete card from database
-        const { error: deleteError } = await supabase
-            .from('cards')
-            .delete()
-            .eq('id', id);
-
-        if (deleteError) throw deleteError;
+        await docRef.delete();
         res.json({ success: true });
 
     } catch (err) {
@@ -363,26 +301,29 @@ app.delete('/cards/:id', async (req, res) => {
     }
 });
 
-// ─── DELETE /cards/expired — cleanup expired cards (can be called by a cron) ─
+// ─── DELETE /cards/cleanup/expired — cleanup expired cards ───────────────────
 app.delete('/cards/cleanup/expired', async (req, res) => {
     try {
-        // Fetch expired cards to clean up their images too
-        const { data: expired, error: fetchError } = await supabase
-            .from('cards')
-            .select('*')
-            .lt('expires_at', new Date().toISOString());
+        const now = admin.firestore.Timestamp.now();
 
-        if (fetchError) throw fetchError;
+        const snapshot = await cardsCollection
+            .where('expires_at', '<=', now)
+            .get();
 
         let deletedCount = 0;
-        for (const card of expired) {
-            const imagesToDelete = [];
-            if (card.cover_image_url) imagesToDelete.push(urlToStoragePath(card.cover_image_url));
-            card.product_image_urls?.forEach(url => imagesToDelete.push(urlToStoragePath(url)));
-            if (imagesToDelete.length > 0) {
-                await supabase.storage.from('side-quest-images').remove(imagesToDelete);
+        for (const doc of snapshot.docs) {
+            const card = doc.data();
+
+            if (card.cover_image_url) {
+                try { await deleteImage(urlToStoragePath(card.cover_image_url)); } catch (e) {}
             }
-            await supabase.from('cards').delete().eq('id', card.id);
+            if (card.product_image_urls?.length) {
+                for (const url of card.product_image_urls) {
+                    try { await deleteImage(urlToStoragePath(url)); } catch (e) {}
+                }
+            }
+
+            await doc.ref.delete();
             deletedCount++;
         }
 
@@ -393,44 +334,48 @@ app.delete('/cards/cleanup/expired', async (req, res) => {
     }
 });
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Upload a file buffer to Supabase Storage and return the public URL
+// Upload a file buffer to Firebase Storage and return the public URL
 async function uploadImage(file) {
     const ext = file.mimetype === 'image/png' ? 'png' : 'jpg';
-    const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}.${ext}`;
+    const filename = `cards/${Date.now()}-${Math.random().toString(36).substring(2, 9)}.${ext}`;
+    const fileRef = bucket.file(filename);
 
-    const { error } = await supabase.storage
-        .from('side-quest-images')
-        .upload(filename, file.buffer, {
-            contentType: file.mimetype,
-            upsert: false
-        });
+    await fileRef.save(file.buffer, {
+        contentType: file.mimetype,
+        public: true
+    });
 
-    if (error) throw error;
-
-    const { data } = supabase.storage
-        .from('side-quest-images')
-        .getPublicUrl(filename);
-
-    return data.publicUrl;
+    return `https://storage.googleapis.com/${bucket.name}/${filename}`;
 }
 
-// Extract the storage path from a full public URL
+// Extract the storage path from a Firebase Storage public URL
 function urlToStoragePath(url) {
-    // Public URLs look like: https://<project>.supabase.co/storage/v1/object/public/side-quest-images/<filename>
-    const marker = '/side-quest-images/';
+    // Public URLs look like: https://storage.googleapis.com/{bucket}/{path}
+    const marker = `${bucket.name}/`;
     const idx = url.indexOf(marker);
     return idx !== -1 ? url.substring(idx + marker.length) : url;
 }
 
-// Delete an image from Supabase Storage
+// Delete a file from Firebase Storage
 async function deleteImage(storagePath) {
-    const { error } = await supabase.storage
-        .from('side-quest-images')
-        .remove([storagePath]);
-    
-    if (error) throw error;
+    await bucket.file(storagePath).delete();
+}
+
+// Format a Firestore doc into the shape the frontend expects
+function formatCard(id, data) {
+    return {
+        id,
+        business_name: data.business_name,
+        employee_name: data.employee_name,
+        webpage_url: data.webpage_url || null,
+        description: data.description,
+        cover_image_url: data.cover_image_url || null,
+        product_image_urls: data.product_image_urls || [],
+        created_at: data.created_at?.toDate ? data.created_at.toDate().toISOString() : data.created_at,
+        expires_at: data.expires_at?.toDate ? data.expires_at.toDate().toISOString() : data.expires_at
+    };
 }
 
 // ─── Start server ─────────────────────────────────────────────────────────────
